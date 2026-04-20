@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bitget 漲幅榜反轉掃描器</title>
+  <style>
+    :root {
+      --bg: #08111f;
+      --panel: #101b2e;
+      --panel2: #13223d;
+      --line: rgba(255,255,255,.08);
+      --text: #eaf2ff;
+      --muted: #8fa4c6;
+      --ok: #2fd49b;
+      --warn: #ffb84d;
+      --bad: #ff6a88;
+      --blue: #61e8ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #11264d 0%, var(--bg) 42%, #050b15 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1320px; margin: 0 auto; padding: 22px; }
+    .hero, .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border: 1px solid var(--line); border-radius: 22px; backdrop-filter: blur(10px);
+      box-shadow: 0 20px 60px rgba(0,0,0,.25);
+    }
+    .hero { padding: 22px; display: grid; gap: 18px; }
+    .hero h1 { margin: 0; font-size: 30px; }
+    .hero p { margin: 0; color: var(--muted); }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 12px; }
+    .pill {
+      background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 16px;
+      padding: 12px 14px;
+    }
+    .pill .k { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .pill .v { font-size: 18px; font-weight: 700; }
+    .toolbar { display:flex; gap:12px; flex-wrap: wrap; }
+    button {
+      border: 0; border-radius: 14px; padding: 12px 16px; cursor: pointer; font-weight: 700;
+      background: linear-gradient(135deg, rgba(97,232,255,.22), rgba(47,212,155,.22)); color: var(--text);
+      border: 1px solid rgba(97,232,255,.25);
+    }
+    .grid { display:grid; grid-template-columns: 1.05fr 1.95fr; gap: 18px; margin-top: 18px; }
+    .panel { padding: 18px; }
+    .panel h2 { margin: 0 0 14px; font-size: 18px; }
+    .small { color: var(--muted); font-size: 13px; }
+    .status {
+      display:flex; justify-content:space-between; align-items:center; gap:12px;
+      padding: 12px 14px; border-radius: 16px; background: rgba(255,255,255,.04); border:1px solid var(--line);
+      margin-bottom: 12px;
+    }
+    .tag { padding: 6px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; }
+    .tag.ok { background: rgba(47,212,155,.14); color: #8effcf; }
+    .tag.bad { background: rgba(255,106,136,.16); color: #ff9bb0; }
+    .tag.warn { background: rgba(255,184,77,.16); color: #ffd082; }
+    .list { display:grid; gap: 12px; }
+    .alert {
+      border: 1px solid var(--line); border-radius: 16px; padding: 14px; background: rgba(255,255,255,.03);
+    }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding: 12px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+    .score { font-weight: 900; }
+    .score.hot { color: #ff9bb0; }
+    .score.mid { color: #ffd082; }
+    .reason { color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .symbol { font-weight: 800; }
+    .chg { font-weight: 800; color: #8effcf; }
+    .muted { color: var(--muted); }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div>
+        <h1>Bitget 漲幅榜前 {{ top_n }} 反轉掃描器</h1>
+        <p>只掃描 24h 漲幅超過 {{ min_change_pct }}% 的標的，偵測疑似高檔反轉，符合條件才發 Discord，不會自動下單。</p>
+      </div>
+      <div class="meta">
+        <div class="pill"><div class="k">市場</div><div class="v">{{ market_type }} / {{ quote }}</div></div>
+        <div class="pill"><div class="k">掃描週期</div><div class="v">{{ scan_interval_sec }} 秒</div></div>
+        <div class="pill"><div class="k">最低分數</div><div class="v">{{ min_score }}</div></div>
+        <div class="pill"><div class="k">通知模式</div><div class="v">Discord Only</div></div>
+      </div>
+      <div class="toolbar">
+        <button onclick="scanNow()">立即掃描一次</button>
+        <button onclick="refreshState()">重新整理面板</button>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <h2>系統狀態</h2>
+        <div class="status"><span class="small">背景掃描</span><span class="tag ok" id="running">--</span></div>
+        <div class="status"><span class="small">最後掃描</span><strong id="lastScan">--</strong></div>
+        <div class="status"><span class="small">掃描次數</span><strong id="scanCount">0</strong></div>
+        <div class="status"><span class="small">最新錯誤</span><strong id="lastError" class="muted">--</strong></div>
+
+        <h2 style="margin-top:18px">最近通知</h2>
+        <div class="list" id="alerts"></div>
+      </section>
+
+      <section class="panel">
+        <h2>候選標的</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>幣種</th>
+              <th>24h 漲幅</th>
+              <th>現價</th>
+              <th>反轉分數</th>
+              <th>狀態</th>
+              <th>理由</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    async function loadJson(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.json();
+    }
+
+    function scoreClass(score) {
+      if (score >= 5) return 'hot';
+      if (score >= 3) return 'mid';
+      return '';
+    }
+
+    function renderAlerts(items) {
+      const box = document.getElementById('alerts');
+      if (!items || !items.length) {
+        box.innerHTML = '<div class="alert muted">目前還沒有送出新通知。</div>';
+        return;
+      }
+      box.innerHTML = items.map(item => {
+        const status = item.error ? `<span class="tag bad">失敗</span>` : `<span class="tag ok">已送出</span>`;
+        return `
+          <div class="alert">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+              <strong>${item.symbol}</strong>${status}
+            </div>
+            <div class="small" style="margin-top:8px;">時間：${item.time || '-'}<br>24h 漲幅：${(item.change_pct || 0).toFixed(2)}%<br>反轉分數：${item.score || 0}${item.error ? `<br>錯誤：${item.error}` : ''}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderRows(items) {
+      const tbody = document.getElementById('rows');
+      if (!items || !items.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="muted">目前沒有符合「前十且 24h 漲幅 > 門檻」的標的。</td></tr>';
+        return;
+      }
+      tbody.innerHTML = items.map(row => {
+        const rev = row.reversal || {};
+        const reasons = (rev.reasons || []).map(x => `• ${x}`).join('<br>') || '—';
+        const triggered = rev.triggered;
+        return `
+          <tr>
+            <td>${row.rank || '-'}</td>
+            <td><div class="symbol">${row.symbol}</div><div class="small">成交額 ${Number(row.quote_volume || 0).toLocaleString()}</div></td>
+            <td><span class="chg">${Number(row.change_pct || 0).toFixed(2)}%</span></td>
+            <td>${Number(row.last || 0).toFixed(6)}</td>
+            <td><span class="score ${scoreClass(rev.score || 0)}">${rev.score || 0}</span></td>
+            <td>${triggered ? '<span class="tag bad">疑似反轉</span>' : '<span class="tag warn">觀察中</span>'}</td>
+            <td class="reason">${reasons}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function refreshState() {
+      const state = await loadJson('/api/state');
+      document.getElementById('running').textContent = state.running ? '運行中' : '未啟動';
+      document.getElementById('running').className = 'tag ' + (state.running ? 'ok' : 'bad');
+      document.getElementById('lastScan').textContent = state.last_scan_at || '--';
+      document.getElementById('scanCount').textContent = state.scan_count || 0;
+      document.getElementById('lastError').textContent = state.last_error || '--';
+      renderAlerts(state.alerts_sent || []);
+      renderRows(state.market_rows || []);
+    }
+
+    async function scanNow() {
+      await loadJson('/api/scan-now');
+      await refreshState();
+    }
+
+    refreshState();
+    setInterval(refreshState, 10000);
+  </script>
+</body>
+</html>
