@@ -56,6 +56,13 @@ class BitgetReversalScanner:
             return False
         return market.get("active", True)
 
+    def _strong_threshold(self) -> int:
+        return max(1, int(config.MIN_REVERSAL_SCORE))
+
+    def _prealert_threshold(self) -> int:
+        strong = self._strong_threshold()
+        return max(1, strong - 1)
+
     def fetch_top_gainers(self) -> List[Dict[str, Any]]:
         self._log("loading markets and tickers...")
         markets = self.exchange.load_markets()
@@ -129,28 +136,69 @@ class BitgetReversalScanner:
             min_wick_body_ratio=config.MIN_WICK_BODY_RATIO,
             near_high_lookback=config.NEAR_HIGH_LOOKBACK,
             near_high_atr_ratio=config.NEAR_HIGH_ATR_RATIO,
-            min_score=config.MIN_REVERSAL_SCORE,
+            min_score=self._strong_threshold(),
         )
 
+        strong_threshold = self._strong_threshold()
+        prealert_threshold = self._prealert_threshold()
+        score = int(reversal.score)
+
+        is_strong = score >= strong_threshold
+        is_prealert = (score >= prealert_threshold) and not is_strong
+
+        if is_strong:
+            alert_level = "strong"
+            status_text = "強信號"
+        elif is_prealert:
+            alert_level = "prealert"
+            status_text = "預警"
+        else:
+            alert_level = "watch"
+            status_text = "觀察中"
+
         result = {
-            "score": reversal.score,
-            "triggered": reversal.triggered,
+            "score": score,
+            "triggered": is_strong,
+            "prealert": is_prealert,
             "reasons": reversal.reasons,
             "payload": reversal.payload,
+            "alert_level": alert_level,
+            "status_text": status_text,
+            "strong_threshold": strong_threshold,
+            "prealert_threshold": prealert_threshold,
         }
 
         self._log(
-            f"{symbol} analyzed -> score={result['score']} triggered={result['triggered']}"
+            f"{symbol} analyzed -> score={result['score']} level={result['alert_level']} "
+            f"triggered={result['triggered']} prealert={result['prealert']}"
         )
         return result
 
-    def _can_alert(self, symbol: str) -> bool:
+    def _cooldown_key(self, symbol: str, level: str) -> str:
+        return f"{symbol}::{level}"
+
+    def _can_alert(self, symbol: str, level: str) -> bool:
         now = time.time()
-        last = self.cooldowns.get(symbol, 0)
+        last = self.cooldowns.get(self._cooldown_key(symbol, level), 0)
         return now - last >= config.ALERT_COOLDOWN_SEC
 
-    def _mark_alerted(self, symbol: str) -> None:
-        self.cooldowns[symbol] = time.time()
+    def _mark_alerted(self, symbol: str, level: str) -> None:
+        self.cooldowns[self._cooldown_key(symbol, level)] = time.time()
+
+    def _should_send_alert(self, result: Dict[str, Any]) -> tuple[bool, str]:
+        if result.get("triggered"):
+            return True, "strong"
+        if result.get("prealert"):
+            return True, "prealert"
+        return False, "watch"
+
+    def _build_alert_payload(self, result: Dict[str, Any], level: str) -> Dict[str, Any]:
+        send_result = dict(result)
+        send_result["alert_level"] = level
+        send_result["notify_title"] = "🚨 強信號" if level == "strong" else "⚠️ 預警"
+        send_result["notify_text"] = "已達正式反轉條件" if level == "strong" else "接近正式反轉條件，先觀察"
+        send_result["status_text"] = "強信號" if level == "strong" else "預警"
+        return send_result
 
     def scan_once(self) -> Dict[str, Any]:
         self._log("scanning top gainers...")
@@ -171,40 +219,44 @@ class BitgetReversalScanner:
             row["reversal"] = result
             analyzed_rows.append(row)
 
-            if result["triggered"]:
+            should_send, level = self._should_send_alert(result)
+            if should_send:
                 self._log(
-                    f"signal detected on {row['symbol']} score={result['score']} "
-                    f"cooldown_ok={self._can_alert(row['symbol'])}"
+                    f"{level} detected on {row['symbol']} score={result['score']} "
+                    f"cooldown_ok={self._can_alert(row['symbol'], level)}"
                 )
 
-            if result["triggered"] and self._can_alert(row["symbol"]):
+            if should_send and self._can_alert(row["symbol"], level):
                 try:
-                    sent = self.notifier.send_reversal_alert(row, result)
+                    send_result = self._build_alert_payload(result, level)
+                    sent = self.notifier.send_reversal_alert(row, send_result)
                     if sent:
-                        self._mark_alerted(row["symbol"])
+                        self._mark_alerted(row["symbol"], level)
                         alert_item = {
                             "symbol": row["symbol"],
                             "change_pct": row["change_pct"],
                             "score": result["score"],
+                            "level": level,
                             "time": self._now_str(),
                         }
                         alerts_sent.append(alert_item)
                         self._log(
-                            f"discord alert sent: {row['symbol']} "
+                            f"discord alert sent: level={level} {row['symbol']} "
                             f"change={row['change_pct']:.2f}% score={result['score']}"
                         )
                     else:
-                        self._log(f"discord alert skipped/failed silently: {row['symbol']}")
+                        self._log(f"discord alert skipped/failed silently: level={level} {row['symbol']}")
                 except Exception as exc:
                     error_item = {
                         "symbol": row["symbol"],
                         "change_pct": row["change_pct"],
                         "score": result["score"],
+                        "level": level,
                         "time": self._now_str(),
                         "error": str(exc),
                     }
                     alerts_sent.append(error_item)
-                    self._log(f"discord alert error for {row['symbol']}: {exc}")
+                    self._log(f"discord alert error for {row['symbol']} level={level}: {exc}")
 
         with self.lock:
             self.state["last_scan_at"] = self._now_str()
@@ -228,7 +280,8 @@ class BitgetReversalScanner:
         self._log(
             f"loop started | interval={config.SCAN_INTERVAL_SEC}s "
             f"| market_type={config.MARKET_TYPE} | quote={config.QUOTE} "
-            f"| min_change={config.MIN_24H_CHANGE_PCT}% | top_n={config.TOP_N}"
+            f"| min_change={config.MIN_24H_CHANGE_PCT}% | top_n={config.TOP_N} "
+            f"| prealert={self._prealert_threshold()} | strong={self._strong_threshold()}"
         )
 
         while True:
